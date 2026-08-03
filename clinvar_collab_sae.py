@@ -177,6 +177,12 @@ if CACHE_WT.exists() and CACHE_VT.exists() and CACHE_MASK.exists():
     h_vt       = np.load(CACHE_VT)
     valid_mask = np.load(CACHE_MASK).astype(bool)
     print(f"  h_wt={h_wt.shape}  h_vt={h_vt.shape}  valid={valid_mask.sum():,}/{N_ms:,}")
+    _pid_cache = CACHE_DIR / "protein_ids_valid.npy"
+    if _pid_cache.exists():
+        protein_ids_valid = np.load(_pid_cache, allow_pickle=True)
+    else:
+        protein_ids_valid = np.array(
+            [vt_ids[i].rsplit(" ", 1)[0] for i in np.where(valid_mask)[0]], dtype=object)
 
 else:
     print("Extracting layer-20 representations (first run — will cache) …")
@@ -241,6 +247,11 @@ else:
     np.save(CACHE_WT,   h_wt)
     np.save(CACHE_VT,   h_vt)
     np.save(CACHE_MASK, valid_mask)
+    # Save per-variant protein IDs and ΔΔG for the valid subset (used by probing notebook)
+    protein_ids_valid = np.array(
+        [vt_ids[i].rsplit(" ", 1)[0] for i in np.where(valid_mask)[0]], dtype=object)
+    np.save(CACHE_DIR / "protein_ids_valid.npy", protein_ids_valid)
+    np.save(CACHE_DIR / "ddg_valid.npy",         ms_ddg[valid_mask].astype(np.float32))
     print(f"  Saved.  valid={valid_mask.sum():,}/{N_ms:,} variants")
 
 # Apply valid mask

@@ -364,6 +364,11 @@ if all_cached:
     mask_wt  = mask_wt[valid_idx]
     bins     = [bins[i] for i in valid_idx]
     N_act    = h_l20_wt.shape[0]
+    _pid_cache = CACHE_DIR / "protein_ids.npy"
+    if _pid_cache.exists():
+        act_protein_ids = np.load(_pid_cache, allow_pickle=True)
+    else:
+        act_protein_ids = np.array([uniprot_accs[i] for i in valid_idx], dtype=object)
     print(f"  l20_wt={h_l20_wt.shape}  lfn_wt={h_lfn_wt.shape}")
     print(f"  GoF={mask_gof.sum()}  LoF={mask_lof.sum()}  wt={mask_wt.sum()}")
 
@@ -450,6 +455,9 @@ else:
     np.save(CACHE_LFN_WT, h_lfn_wt)
     np.save(CACHE_LFN_VT, h_lfn_vt)
     np.save(CACHE_VALID,  valid_idx)
+    # Save per-variant protein IDs for LOPO probing
+    act_protein_ids = np.array([uniprot_accs[i] for i in valid_idx], dtype=object)
+    np.save(CACHE_DIR / "protein_ids.npy", act_protein_ids)
     print(f"\nSaved.  valid={N_act:,}/{len(valid_mask):,} variants")
 
 print(f"Final: N={N_act:,}  GoF={mask_gof.sum()}  LoF={mask_lof.sum()}  wt={mask_wt.sum()}")

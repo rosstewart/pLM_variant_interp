@@ -1757,3 +1757,23 @@ torch.save(model_d6.state_dict(),       OUT_DIR / "v2_model_d6_sup_topk.pt")
 torch.save(model_d7.state_dict(),       OUT_DIR / "v2_model_d7_topk_diff.pt")
 torch.save(model_d8.state_dict(),       OUT_DIR / "v2_model_d8_sup_topk_diff.pt")
 print("Models saved.")
+
+# ── Save arrays for probing analysis notebook ──────────────────────────────────
+from scipy import sparse as _sp
+
+_MS_CACHE = Path("/data/ross/interp")
+_MS_CACHE.mkdir(parents=True, exist_ok=True)
+
+# MegaScale protein IDs and ΔΔG (small — go to OUT_DIR)
+np.save(OUT_DIR / "ms_protein_ids.npy",
+        np.array([v.rsplit(" ", 1)[0] for v in vt_ids], dtype=object))
+np.save(OUT_DIR / "ms_ddg.npy", ms_ddg.astype(np.float32))
+
+# Final-layer mutation diff for D5 baseline (1024-dim; 1.1 GB → /data/ross/interp)
+np.save(_MS_CACHE / "ms_x_diff.npy",
+        (X_ms[:, 1024:] - X_ms[:, :1024]).astype(np.float32))
+
+# D5 MegaScale encodings saved as sparse npz (~280 MB vs 8.9 GB dense)
+_Z_d5_sparse = _sp.csr_matrix(Z_by_model["D5_TopKSAE"].astype(np.float32))
+_sp.save_npz(str(_MS_CACHE / "ms_z_d5_sparse.npz"), _Z_d5_sparse)
+print(f"Probing arrays saved → {_MS_CACHE}  (sparse nnz={_Z_d5_sparse.nnz:,})")
