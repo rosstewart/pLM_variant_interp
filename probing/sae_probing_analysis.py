@@ -40,26 +40,29 @@ from sklearn.metrics import (
 # ## 1. Config
 
 # %%
-STAB_CACHE = Path("/data/ross/interp/collab_sae_cache")
-ACT_CACHE  = Path("/data/ross/interp/activity_sae_cache")
-MS_CACHE   = Path("/data/ross/interp")
-V2_DIR     = Path("/home/rcstewart/ppi_lossgain/sparse_bottleneck")
-OUT_DIR    = Path("/home/rcstewart/ppi_lossgain/sparse_bottleneck")
+STAB_CACHE   = Path("/data/ross/interp/collab_sae_cache")
+ACT_CACHE    = Path("/data/ross/interp/activity_sae_cache")
+MS_CACHE     = Path("/data/ross/interp")
+V2_DIR       = Path("/home/rcstewart/ppi_lossgain/sparse_bottleneck")
+OUT_DIR      = Path("/home/rcstewart/ppi_lossgain/sparse_bottleneck")
+MEGASCALE_PKL = "/data/ross/ppi_lossgain/interaction_loss/megascale_preprocessed/preprocessed.pkl"
 
-# L1 hyperparameter grid — sklearn C = 1/λ
-# C=1: strong regularization (very sparse); C=256: weak (many features used)
-C_VALUES = [1, 4, 16, 64, 256]
-
-# Lasso alpha grid for regression (alpha = 1/C: 1.0 strong → 0.004 weak)
-LASSO_ALPHAS = [1.0 / c for c in C_VALUES]
+# L1 hyperparameter grid — sklearn C = 1/λ (inverse regularization strength).
+# C=0.01 → λ=100 (very sparse: 0-2 nonzero features)
+# C=10   → λ=0.1  (~3-5 nonzero features)
+# C=100  → λ=0.01 (hundreds of nonzero features, nearly dense)
+C_VALUES = [0.01, 0.1, 1, 10, 100]
 
 # Stability 3-class bins (extreme bins only — mildly stab/destab excluded)
 STAB_DDG_THRESH  = -1.0   # ΔΔG < this → class 0 (stabilizing)
 NEUT_DDG_MAX     =  0.5   # |ΔΔG| < this → class 1 (neutral)
 DEST_DDG_THRESH  =  1.5   # ΔΔG ≥ this → class 2 (destabilizing)
 
-LOPO_MAX_ITER    = 2000   # LogisticRegression max_iter
 N_TOP_FEATURES   = 50     # features to plot in importance bar charts
+
+# Downsample stability training set for fast exploratory runs.
+# Set to None to use the full ~215k training samples.
+STAB_TRAIN_SUBSAMPLE = 20_000
 
 print("Config loaded.")
 
@@ -69,8 +72,13 @@ print("Config loaded.")
 # Collab SAE: signed ΔZ = dz_pos − dz_neg (16384-dim).
 # D5 on MegaScale: loaded as sparse npz, restricted to collab valid_mask.
 # Baselines: layer-20 and final-layer VT−WT mutation diffs (1024-dim each).
+#
+# Train/test split: uses the pre-computed protein-grouped split from preprocessed.pkl
+# (same split used for SAE training in v2.py), mapped into valid-mask space.
+# This avoids LOPO over 298 proteins which would be extremely slow.
 
 # %%
+import pickle
 print("Loading stability data …")
 
 valid_mask       = np.load(STAB_CACHE / "valid_mask.npy").astype(bool)
@@ -81,9 +89,11 @@ h_vt_stab        = np.load(STAB_CACHE / "layer20_vt.npy")
 ddg_stab         = np.load(STAB_CACHE / "ddg_valid.npy")
 pid_stab         = np.load(STAB_CACHE / "protein_ids_valid.npy", allow_pickle=True)
 
-# Signed ΔZ: (N_valid, 16384); already filtered by valid_mask inside collab notebook
-dz_stab = (dz_pos_stab - dz_neg_stab).astype(np.float32)
+# Signed ΔZ — convert immediately to sparse CSR (ΔZ has k=256/16384 ≈ 3% density per
+# sample; sparse saves ~15 GB dense → ~500 MB and makes batch extraction fast)
+dz_stab = sp.csr_matrix((dz_pos_stab - dz_neg_stab).astype(np.float32))
 del dz_pos_stab, dz_neg_stab
+print(f"  dz_stab sparse: nnz={dz_stab.nnz:,}  density={dz_stab.nnz/np.prod(dz_stab.shape):.2%}")
 
 # Baseline: layer-20 VT−WT mutation diff
 baseline_stab_collab = (h_vt_stab - h_wt_stab).astype(np.float32)
@@ -103,6 +113,31 @@ del x_diff_full
 
 print(f"  N_valid={len(ddg_stab):,}  N_proteins={len(np.unique(pid_stab))}")
 print(f"  dz_stab={dz_stab.shape}  Z_d5_stab={Z_d5_stab.shape}")
+
+# ── Load pre-computed protein-grouped train/test split from pkl ───────────────
+# Split indices are in N_ms space; map them into N_valid (valid_mask) space.
+print("  Loading pkl train/test splits …")
+with open(MEGASCALE_PKL, "rb") as f:
+    _ms = pickle.load(f)
+_splits = _ms["splits"]
+del _ms
+
+# Build mapping: ms_index → valid_index (only for rows that passed valid_mask)
+_valid_positions = np.where(valid_mask)[0]          # shape (N_valid,), values in [0, N_ms)
+_ms_to_valid     = {int(ms_i): v_i for v_i, ms_i in enumerate(_valid_positions)}
+
+def _map_split(ms_indices):
+    """Map pkl split indices (N_ms space) → valid space, dropping rows not in valid_mask."""
+    return np.array([_ms_to_valid[i] for i in ms_indices if i in _ms_to_valid])
+
+stab_train_idx = _map_split(_splits["train"])
+stab_test_idx  = _map_split(_splits["test"])
+print(f"  Stability train={len(stab_train_idx):,}  test={len(stab_test_idx):,} (after valid_mask)")
+
+if STAB_TRAIN_SUBSAMPLE and len(stab_train_idx) > STAB_TRAIN_SUBSAMPLE:
+    _rng = np.random.default_rng(42)
+    stab_train_idx = np.sort(_rng.choice(stab_train_idx, STAB_TRAIN_SUBSAMPLE, replace=False))
+    print(f"  Downsampled stability train → {len(stab_train_idx):,}")
 
 # Build stability labels
 mask_s_stab = ddg_stab <  STAB_DDG_THRESH               # highly stabilizing
@@ -173,7 +208,7 @@ scores_act  = scores_act_full[_valid_idx]
 bins_act    = [bins_act_full[i] for i in _valid_idx]
 del _df, _df_act, _df_var, scores_act_full, bins_act_full
 
-dz_act = (dz_pos_act - dz_neg_act).astype(np.float32)
+dz_act = sp.csr_matrix((dz_pos_act - dz_neg_act).astype(np.float32))
 del dz_pos_act, dz_neg_act
 baseline_act_collab = (h_l20_vt - h_l20_wt).astype(np.float32)
 baseline_act_d5     = (h_lfn_vt - h_lfn_wt).astype(np.float32)
@@ -193,289 +228,203 @@ print(f"  N_act={len(bins_act):,}  N_proteins={len(np.unique(pid_act))}")
 print(f"  LoF={mask_lof.sum()}  wt-like={mask_wt.sum()}  GoF={mask_gof.sum()}")
 print(f"  dz_act={dz_act.shape}  Z_d5_act={Z_d5_act.shape}")
 
+# Within-protein 80/20 stratified split: hold out 20% of variants per protein
+# per label bin. Tests whether SAE features rank variants within a protein —
+# the cross-protein split had near-chance results because GoF/LoF signals are
+# protein-family-specific and don't transfer across gene families.
+_rng_act   = np.random.default_rng(42)
+_train_idx, _test_idx = [], []
+for _prot in np.unique(pid_act):
+    _pidx = np.where(pid_act == _prot)[0]
+    # stratify by bin label so each split keeps all classes represented
+    for _lbl in np.unique(y_act_3[_pidx]):
+        _lidx = _pidx[y_act_3[_pidx] == _lbl]
+        if len(_lidx) < 2:
+            _train_idx.extend(_lidx)   # too few to split — keep in train
+            continue
+        _n_test = max(1, int(len(_lidx) * 0.20))
+        _perm   = _rng_act.permutation(len(_lidx))
+        _test_idx.extend(_lidx[_perm[:_n_test]])
+        _train_idx.extend(_lidx[_perm[_n_test:]])
+
+act_train_idx = np.array(sorted(_train_idx))
+act_test_idx  = np.array(sorted(_test_idx))
+print(f"  Activity within-protein split: train={len(act_train_idx):,}  test={len(act_test_idx):,}")
+
 # %% [markdown]
-# ## 4. LOPO Utilities
+# ## 4. Training Utilities — sklearn L1 (saga / Lasso)
+#
+# L1 classifiers use **LogisticRegression(penalty='l1', solver='saga')**, which applies
+# exact ISTA-style soft-thresholding in Cython — provably produces exact zeros.
+# Adam + proximal thresholding was dropped: Adam's adaptive step (~lr/sqrt(eps) ≈ 100)
+# overwhelms the threshold, preventing true sparsity even at strong regularization.
+#
+# saga accepts scipy sparse CSR directly; no densification or GPU needed.
+# C = 1/λ; small C = strong regularization = few nonzero features.
 
 # %%
-def _to_sparse(X):
-    """Convert dense ndarray to csr_matrix if not already sparse."""
-    if sp.issparse(X):
-        return X.tocsr()
-    return sp.csr_matrix(X)
+
+def _fit_classify(X, y, train_idx, test_idx, C):
+    classes = np.unique(y[train_idx])
+    binary  = len(classes) == 2
+    multi   = "ovr" if binary else "multinomial"
+    clf = LogisticRegression(
+        penalty="l1", C=C, solver="saga", multi_class=multi,
+        class_weight="balanced", max_iter=5000, tol=1e-4)
+    clf.fit(X[train_idx], y[train_idx])
+    probs = clf.predict_proba(X[test_idx])
+    preds = clf.predict(X[test_idx])
+    coef  = clf.coef_   # (1, D) binary or (K, D) multiclass
+    return preds, probs, coef, classes
 
 
-def lopo_classify(X, y, protein_ids, C, multiclass=True, max_iter=LOPO_MAX_ITER):
-    """
-    Leave-one-protein-out L1 logistic regression.
-    X: (N, D) array or sparse matrix.
-    y: (N,) int labels — must have no -1 (filter before calling).
-    Returns: dict with test metrics and mean coefficient vector (D,).
-    """
-    X_sp      = _to_sparse(X)
-    proteins  = np.unique(protein_ids)
-    solver    = "saga" if multiclass else "liblinear"
-    classes   = np.unique(y)
-    n_classes = len(classes)
-    binary    = n_classes == 2
+def _fit_regress(X, y, train_idx, test_idx, alpha):
+    reg = Lasso(alpha=alpha, max_iter=10000, tol=1e-4, selection="cyclic")
+    reg.fit(X[train_idx], y[train_idx])
+    preds = reg.predict(X[test_idx])
+    return preds, reg.coef_
 
-    y_true_all, y_pred_all, y_prob_all = [], [], []
-    coef_sum = None
 
-    for prot in proteins:
-        test_mask  = protein_ids == prot
-        train_mask = ~test_mask
-        if test_mask.sum() == 0 or train_mask.sum() == 0:
-            continue
-
-        X_tr = X_sp[train_mask]
-        X_te = X_sp[test_mask]
-        y_tr = y[train_mask]
-        y_te = y[test_mask]
-
-        if len(np.unique(y_tr)) < n_classes:
-            continue   # skip if train lacks a class
-
-        # Scale: fit on train sparse rows (StandardScaler with_mean=False for sparse)
-        scaler = StandardScaler(with_mean=False)
-        X_tr   = scaler.fit_transform(X_tr)
-        X_te   = scaler.transform(X_te)
-
-        multi = "multinomial" if (multiclass and not binary) else "ovr"
-        clf = LogisticRegression(
-            penalty="l1", C=C, solver=solver,
-            multi_class=multi, max_iter=max_iter,
-            class_weight="balanced", warm_start=False,
-        )
-        clf.fit(X_tr, y_tr)
-
-        y_pred = clf.predict(X_te)
-        y_prob = clf.predict_proba(X_te)
-
-        y_true_all.append(y_te)
-        y_pred_all.append(y_pred)
-        y_prob_all.append(y_prob)
-
-        # Accumulate coefficients
-        c = clf.coef_[0] if binary else clf.coef_.mean(0)  # (D,) signed average
-        coef_sum = c if coef_sum is None else coef_sum + c
-
-    if not y_true_all:
-        return {}
-
-    y_true = np.concatenate(y_true_all)
-    y_pred = np.concatenate(y_pred_all)
-    y_prob = np.concatenate(y_prob_all, axis=0)
-    coef_mean = coef_sum / len(proteins)
-
+def _classify_metrics(y_te, preds, probs, coef, classes):
+    binary    = len(classes) == 2
+    coef_mean = coef[0] if binary else coef.mean(0)
     result = dict(
-        test_acc          = accuracy_score(y_true, y_pred),
-        test_balanced_acc = balanced_accuracy_score(y_true, y_pred),
+        test_acc          = accuracy_score(y_te, preds),
+        test_balanced_acc = balanced_accuracy_score(y_te, preds),
         coef_mean         = coef_mean,
-        n_folds           = len(proteins),
+        n_nonzero_coef    = int((coef_mean != 0).sum()),
     )
     try:
-        if binary:
-            result["test_auc"] = roc_auc_score(y_true, y_prob[:, 1])
-        else:
-            result["test_auc"] = roc_auc_score(
-                y_true, y_prob, multi_class="ovr", average="macro",
-                labels=classes)
+        result["test_auc"] = (roc_auc_score(y_te, probs[:, 1]) if binary else
+                              roc_auc_score(y_te, probs, multi_class="ovr",
+                                            average="macro", labels=classes))
     except Exception:
         result["test_auc"] = float("nan")
-
     return result
 
 
-def lopo_regress(X, y, protein_ids, alpha):
-    """
-    Leave-one-protein-out Lasso regression.
-    Returns dict with test metrics and mean coefficient vector.
-    """
-    X_sp     = _to_sparse(X)
-    proteins = np.unique(protein_ids)
-
-    y_true_all, y_pred_all = [], []
-    coef_sum = None
-
-    for prot in proteins:
-        test_mask  = protein_ids == prot
-        train_mask = ~test_mask
-        if test_mask.sum() == 0 or train_mask.sum() == 0:
-            continue
-
-        X_tr = X_sp[train_mask].toarray()
-        X_te = X_sp[test_mask].toarray()
-        y_tr = y[train_mask]
-        y_te = y[test_mask]
-
-        scaler = StandardScaler()
-        X_tr   = scaler.fit_transform(X_tr)
-        X_te   = scaler.transform(X_te)
-
-        reg = Lasso(alpha=alpha, max_iter=5000, warm_start=False)
-        reg.fit(X_tr, y_tr)
-
-        y_pred = reg.predict(X_te)
-        y_true_all.append(y_te)
-        y_pred_all.append(y_pred)
-
-        coef_sum = reg.coef_.copy() if coef_sum is None else coef_sum + reg.coef_
-
-    if not y_true_all:
-        return {}
-
-    y_true = np.concatenate(y_true_all)
-    y_pred = np.concatenate(y_pred_all)
-
+def _regress_metrics(y_te, preds, coef):
     return dict(
-        test_r2   = r2_score(y_true, y_pred),
-        test_mse  = mean_squared_error(y_true, y_pred),
-        coef_mean = coef_sum / len(proteins),
-        n_folds   = len(proteins),
+        test_r2        = r2_score(y_te, preds),
+        test_mse       = mean_squared_error(y_te, preds),
+        coef_mean      = coef,
+        n_nonzero_coef = int((coef != 0).sum()),
     )
 
 
-def lopo_baseline_classify(X, y, protein_ids, multiclass=True):
-    """L2 logistic regression (no sparsity) on raw ProtT5 features."""
-    X_sp      = _to_sparse(X)
-    proteins  = np.unique(protein_ids)
-    binary    = len(np.unique(y)) == 2
-    multi     = "multinomial" if (multiclass and not binary) else "ovr"
-    solver    = "lbfgs" if multiclass else "liblinear"
-    classes   = np.unique(y)
+# ── Train/test split wrappers ──────────────────────────────────────────────────
 
-    y_true_all, y_pred_all, y_prob_all = [], [], []
+def tt_classify(X, y, train_idx, test_idx, C, multiclass=True):
+    preds, probs, coef, classes = _fit_classify(X, y, train_idx, test_idx, C)
+    return _classify_metrics(y[test_idx], preds, probs, coef, classes)
 
-    for prot in proteins:
-        test_mask  = protein_ids == prot
-        train_mask = ~test_mask
-        if test_mask.sum() == 0 or train_mask.sum() == 0:
-            continue
-        X_tr = X_sp[train_mask].toarray()
-        X_te = X_sp[test_mask].toarray()
-        y_tr = y[train_mask]
-        y_te = y[test_mask]
-        if len(np.unique(y_tr)) < len(classes):
-            continue
 
-        scaler = StandardScaler()
-        X_tr   = scaler.fit_transform(X_tr)
-        X_te   = scaler.transform(X_te)
+def tt_regress(X, y, train_idx, test_idx, alpha):
+    preds, coef = _fit_regress(X, y, train_idx, test_idx, alpha)
+    return _regress_metrics(y[test_idx], preds, coef)
 
-        clf = LogisticRegression(
-            penalty="l2", C=1.0, solver=solver,
-            multi_class=multi, max_iter=LOPO_MAX_ITER,
-            class_weight="balanced",
-        )
-        clf.fit(X_tr, y_tr)
-        y_true_all.append(y_te)
-        y_pred_all.append(clf.predict(X_te))
-        y_prob_all.append(clf.predict_proba(X_te))
 
-    if not y_true_all:
-        return {}
+# ── sklearn L2 baselines (no sparsity penalty — upper-bound reference) ────────
 
-    y_true = np.concatenate(y_true_all)
-    y_pred = np.concatenate(y_pred_all)
-    y_prob = np.concatenate(y_prob_all, axis=0)
+def _dense(X, idx):
+    rows = X[idx]
+    return rows.toarray().astype(np.float32) if sp.issparse(rows) else np.asarray(rows, np.float32)
 
-    result = dict(
-        test_acc          = accuracy_score(y_true, y_pred),
-        test_balanced_acc = balanced_accuracy_score(y_true, y_pred),
-        n_folds           = len(proteins),
-    )
+def tt_baseline_classify(X, y, train_idx, test_idx, multiclass=True):
+    X_tr, X_te = _dense(X, train_idx), _dense(X, test_idx)
+    y_tr, y_te = y[train_idx], y[test_idx]
+    classes    = np.unique(y_tr)
+    binary     = len(classes) == 2
+    scaler     = StandardScaler(); X_tr = scaler.fit_transform(X_tr); X_te = scaler.transform(X_te)
+    solver     = "lbfgs" if (multiclass and not binary) else "liblinear"
+    multi      = "multinomial" if (multiclass and not binary) else "ovr"
+    clf = LogisticRegression(penalty="l2", C=1.0, solver=solver, multi_class=multi,
+                             max_iter=2000, class_weight="balanced")
+    clf.fit(X_tr, y_tr)
+    y_pred, y_prob = clf.predict(X_te), clf.predict_proba(X_te)
+    result = dict(test_acc=accuracy_score(y_te, y_pred),
+                  test_balanced_acc=balanced_accuracy_score(y_te, y_pred))
     try:
-        if binary:
-            result["test_auc"] = roc_auc_score(y_true, y_prob[:, 1])
-        else:
-            result["test_auc"] = roc_auc_score(
-                y_true, y_prob, multi_class="ovr", average="macro", labels=classes)
+        result["test_auc"] = (roc_auc_score(y_te, y_prob[:, 1]) if binary else
+                              roc_auc_score(y_te, y_prob, multi_class="ovr",
+                                            average="macro", labels=classes))
     except Exception:
         result["test_auc"] = float("nan")
     return result
 
+def tt_baseline_regress(X, y, train_idx, test_idx):
+    X_tr, X_te = _dense(X, train_idx), _dense(X, test_idx)
+    scaler = StandardScaler(); X_tr = scaler.fit_transform(X_tr); X_te = scaler.transform(X_te)
+    reg = Ridge(alpha=1.0); reg.fit(X_tr, y[train_idx])
+    y_pred = reg.predict(X_te)
+    return dict(test_r2=r2_score(y[test_idx], y_pred),
+                test_mse=mean_squared_error(y[test_idx], y_pred))
 
-def lopo_baseline_regress(X, y, protein_ids):
-    """Ridge regression (no sparsity) on raw ProtT5 features."""
-    X_sp     = _to_sparse(X)
-    proteins = np.unique(protein_ids)
-    y_true_all, y_pred_all = [], []
-
-    for prot in proteins:
-        test_mask  = protein_ids == prot
-        train_mask = ~test_mask
-        if test_mask.sum() == 0 or train_mask.sum() == 0:
-            continue
-        X_tr = X_sp[train_mask].toarray()
-        X_te = X_sp[test_mask].toarray()
-        scaler = StandardScaler()
-        X_tr   = scaler.fit_transform(X_tr)
-        X_te   = scaler.transform(X_te)
-        reg = Ridge(alpha=1.0)
-        reg.fit(X_tr, y[train_mask])
-        y_true_all.append(y[test_mask])
-        y_pred_all.append(reg.predict(X_te))
-
-    if not y_true_all:
-        return {}
-    y_true = np.concatenate(y_true_all)
-    y_pred = np.concatenate(y_pred_all)
-    return dict(test_r2=r2_score(y_true, y_pred),
-                test_mse=mean_squared_error(y_true, y_pred),
-                n_folds=len(proteins))
-
-
-def run_grid(X, y, protein_ids, c_values, task="classify", multiclass=True, label=""):
-    """Run LOPO across all C values for a single (X, y, protein_ids) combo."""
+def run_tt_grid(X, y, train_idx, test_idx, c_values, task="classify",
+                multiclass=True, label=""):
+    """Train/test grid sweep using sklearn L1 saga (classify) or Lasso (regress)."""
     results = {}
-    fn = lopo_classify if task == "classify" else lopo_regress
-    for C in tqdm(c_values, desc=f"{label}  {'classify' if task=='classify' else 'regress'}"):
+    fn = tt_classify if task == "classify" else tt_regress
+    for C in tqdm(c_values, desc=label):
         kw = dict(C=C, multiclass=multiclass) if task == "classify" else dict(alpha=1.0/C)
-        results[C] = fn(X, y, protein_ids, **kw)
+        results[C] = fn(X, y, train_idx, test_idx, **kw)
     return results
 
 # %% [markdown]
 # ## 5. Stability — Collab SAE Probing
+#
+# Uses the pre-computed protein-grouped train/test split from preprocessed.pkl.
+# Avoids LOPO over 298 proteins (which would take hours); one train/test fit per C.
 
 # %%
 print("=== Stability: Collab SAE (16384-dim ΔZ) ===")
-idx3  = np.where(mask_s_3cls)[0]
-pidx3 = pid_stab[idx3]
+
+# Build per-task train/test index arrays restricted to each bin subset.
+# All indices are in N_valid space (rows of dz_stab, y_stab_3, etc.)
+idx3      = np.where(mask_s_3cls)[0]
+idx3_set  = set(idx3.tolist())
+mask_sn   = mask_s_stab | mask_s_neut
+mask_dn   = mask_s_dest | mask_s_neut
+
+def _split_subset(global_train, global_test, subset_mask):
+    """Restrict pre-computed train/test arrays to a bin subset."""
+    sub_idx  = np.where(subset_mask)[0]
+    sub_set  = set(sub_idx.tolist())
+    tr = np.array([i for i in global_train if i in sub_set])
+    te = np.array([i for i in global_test  if i in sub_set])
+    return tr, te
+
+tr3, te3       = _split_subset(stab_train_idx, stab_test_idx, mask_s_3cls)
+tr_sn, te_sn   = _split_subset(stab_train_idx, stab_test_idx, mask_sn)
+tr_dn, te_dn   = _split_subset(stab_train_idx, stab_test_idx, mask_dn)
 
 STAB_COLLAB = {}
 
-# 3-class (stab / neutral / destab)
-STAB_COLLAB["3class"] = run_grid(
-    dz_stab[idx3], y_stab_3[idx3], pidx3, C_VALUES,
+STAB_COLLAB["3class"] = run_tt_grid(
+    dz_stab, y_stab_3, tr3, te3, C_VALUES,
     task="classify", multiclass=True, label="Collab 3-class")
 
-# Binary: stab vs neutral
-mask_sn = mask_s_stab | mask_s_neut
-STAB_COLLAB["stab_vs_neut"] = run_grid(
-    dz_stab[mask_sn], y_stab_3[mask_sn], pid_stab[mask_sn], C_VALUES,
+STAB_COLLAB["stab_vs_neut"] = run_tt_grid(
+    dz_stab, y_stab_3, tr_sn, te_sn, C_VALUES,
     task="classify", multiclass=False, label="Collab stab/neut")
 
-# Binary: destab vs neutral
-mask_dn = mask_s_dest | mask_s_neut
-STAB_COLLAB["dest_vs_neut"] = run_grid(
-    dz_stab[mask_dn], y_stab_3[mask_dn], pid_stab[mask_dn], C_VALUES,
+STAB_COLLAB["dest_vs_neut"] = run_tt_grid(
+    dz_stab, y_stab_3, tr_dn, te_dn, C_VALUES,
     task="classify", multiclass=False, label="Collab dest/neut")
 
-# Regression on ΔΔG
-STAB_COLLAB["regression"] = run_grid(
-    dz_stab, y_stab_cont, pid_stab, C_VALUES,
+STAB_COLLAB["regression"] = run_tt_grid(
+    dz_stab, y_stab_cont, stab_train_idx, stab_test_idx, C_VALUES,
     task="regress", label="Collab regression")
 
-# Baseline (raw layer-20 diff)
 print("  Baseline (L2 logistic / Ridge) …")
-STAB_COLLAB["baseline_3class"]     = lopo_baseline_classify(
-    baseline_stab_collab[idx3], y_stab_3[idx3], pidx3, multiclass=True)
-STAB_COLLAB["baseline_stab_neut"]  = lopo_baseline_classify(
-    baseline_stab_collab[mask_sn], y_stab_3[mask_sn], pid_stab[mask_sn], multiclass=False)
-STAB_COLLAB["baseline_dest_neut"]  = lopo_baseline_classify(
-    baseline_stab_collab[mask_dn], y_stab_3[mask_dn], pid_stab[mask_dn], multiclass=False)
-STAB_COLLAB["baseline_regression"] = lopo_baseline_regress(
-    baseline_stab_collab, y_stab_cont, pid_stab)
+STAB_COLLAB["baseline_3class"]     = tt_baseline_classify(
+    baseline_stab_collab, y_stab_3, tr3, te3, multiclass=True)
+STAB_COLLAB["baseline_stab_neut"]  = tt_baseline_classify(
+    baseline_stab_collab, y_stab_3, tr_sn, te_sn, multiclass=False)
+STAB_COLLAB["baseline_dest_neut"]  = tt_baseline_classify(
+    baseline_stab_collab, y_stab_3, tr_dn, te_dn, multiclass=False)
+STAB_COLLAB["baseline_regression"] = tt_baseline_regress(
+    baseline_stab_collab, y_stab_cont, stab_train_idx, stab_test_idx)
 
 print("Done.")
 
@@ -487,31 +436,31 @@ print("=== Stability: D5 TopKSAE (8192-dim Z) ===")
 
 STAB_D5 = {}
 
-STAB_D5["3class"] = run_grid(
-    Z_d5_stab[idx3], y_stab_3[idx3], pidx3, C_VALUES,
+STAB_D5["3class"] = run_tt_grid(
+    Z_d5_stab, y_stab_3, tr3, te3, C_VALUES,
     task="classify", multiclass=True, label="D5 3-class")
 
-STAB_D5["stab_vs_neut"] = run_grid(
-    Z_d5_stab[mask_sn], y_stab_3[mask_sn], pid_stab[mask_sn], C_VALUES,
+STAB_D5["stab_vs_neut"] = run_tt_grid(
+    Z_d5_stab, y_stab_3, tr_sn, te_sn, C_VALUES,
     task="classify", multiclass=False, label="D5 stab/neut")
 
-STAB_D5["dest_vs_neut"] = run_grid(
-    Z_d5_stab[mask_dn], y_stab_3[mask_dn], pid_stab[mask_dn], C_VALUES,
+STAB_D5["dest_vs_neut"] = run_tt_grid(
+    Z_d5_stab, y_stab_3, tr_dn, te_dn, C_VALUES,
     task="classify", multiclass=False, label="D5 dest/neut")
 
-STAB_D5["regression"] = run_grid(
-    Z_d5_stab, y_stab_cont, pid_stab, C_VALUES,
+STAB_D5["regression"] = run_tt_grid(
+    Z_d5_stab, y_stab_cont, stab_train_idx, stab_test_idx, C_VALUES,
     task="regress", label="D5 regression")
 
 print("  Baseline (L2 logistic / Ridge) …")
-STAB_D5["baseline_3class"]     = lopo_baseline_classify(
-    baseline_stab_d5[idx3], y_stab_3[idx3], pidx3, multiclass=True)
-STAB_D5["baseline_stab_neut"]  = lopo_baseline_classify(
-    baseline_stab_d5[mask_sn], y_stab_3[mask_sn], pid_stab[mask_sn], multiclass=False)
-STAB_D5["baseline_dest_neut"]  = lopo_baseline_classify(
-    baseline_stab_d5[mask_dn], y_stab_3[mask_dn], pid_stab[mask_dn], multiclass=False)
-STAB_D5["baseline_regression"] = lopo_baseline_regress(
-    baseline_stab_d5, y_stab_cont, pid_stab)
+STAB_D5["baseline_3class"]     = tt_baseline_classify(
+    baseline_stab_d5, y_stab_3, tr3, te3, multiclass=True)
+STAB_D5["baseline_stab_neut"]  = tt_baseline_classify(
+    baseline_stab_d5, y_stab_3, tr_sn, te_sn, multiclass=False)
+STAB_D5["baseline_dest_neut"]  = tt_baseline_classify(
+    baseline_stab_d5, y_stab_3, tr_dn, te_dn, multiclass=False)
+STAB_D5["baseline_regression"] = tt_baseline_regress(
+    baseline_stab_d5, y_stab_cont, stab_train_idx, stab_test_idx)
 
 print("Done.")
 
@@ -520,38 +469,49 @@ print("Done.")
 
 # %%
 print("=== Activity: Collab SAE (16384-dim ΔZ) ===")
-idx_act3  = np.where(mask_gof | mask_lof | mask_wt)[0]
-pid_act3  = pid_act[idx_act3]
+mask_lw   = mask_lof | mask_wt
+mask_gw   = mask_gof | mask_wt
+mask_3cls = mask_lof | mask_wt | mask_gof
+
+def _act_split(subset_mask):
+    """Restrict activity protein-grouped train/test to a bin subset."""
+    sub = np.where(subset_mask)[0]
+    sub_set = set(sub.tolist())
+    tr = np.array([i for i in act_train_idx if i in sub_set])
+    te = np.array([i for i in act_test_idx  if i in sub_set])
+    return tr, te
+
+tr_act3, te_act3 = _act_split(mask_3cls)
+tr_lw,   te_lw   = _act_split(mask_lw)
+tr_gw,   te_gw   = _act_split(mask_gw)
 
 ACT_COLLAB = {}
 
-ACT_COLLAB["3class"] = run_grid(
-    dz_act[idx_act3], y_act_3[idx_act3], pid_act3, C_VALUES,
+ACT_COLLAB["3class"] = run_tt_grid(
+    dz_act, y_act_3, tr_act3, te_act3, C_VALUES,
     task="classify", multiclass=True, label="Collab act 3-class")
 
-mask_lw = mask_lof | mask_wt
-ACT_COLLAB["lof_vs_wt"] = run_grid(
-    dz_act[mask_lw], y_act_3[mask_lw], pid_act[mask_lw], C_VALUES,
+ACT_COLLAB["lof_vs_wt"] = run_tt_grid(
+    dz_act, y_act_3, tr_lw, te_lw, C_VALUES,
     task="classify", multiclass=False, label="Collab LoF/wt")
 
-mask_gw = mask_gof | mask_wt
-ACT_COLLAB["gof_vs_wt"] = run_grid(
-    dz_act[mask_gw], y_act_3[mask_gw], pid_act[mask_gw], C_VALUES,
+ACT_COLLAB["gof_vs_wt"] = run_tt_grid(
+    dz_act, y_act_3, tr_gw, te_gw, C_VALUES,
     task="classify", multiclass=False, label="Collab GoF/wt")
 
-ACT_COLLAB["regression"] = run_grid(
-    dz_act, y_act_cont, pid_act, C_VALUES,
+ACT_COLLAB["regression"] = run_tt_grid(
+    dz_act, y_act_cont, act_train_idx, act_test_idx, C_VALUES,
     task="regress", label="Collab act regression")
 
 print("  Baseline …")
-ACT_COLLAB["baseline_3class"]  = lopo_baseline_classify(
-    baseline_act_collab[idx_act3], y_act_3[idx_act3], pid_act3, multiclass=True)
-ACT_COLLAB["baseline_lof_wt"]  = lopo_baseline_classify(
-    baseline_act_collab[mask_lw], y_act_3[mask_lw], pid_act[mask_lw], multiclass=False)
-ACT_COLLAB["baseline_gof_wt"]  = lopo_baseline_classify(
-    baseline_act_collab[mask_gw], y_act_3[mask_gw], pid_act[mask_gw], multiclass=False)
-ACT_COLLAB["baseline_regression"] = lopo_baseline_regress(
-    baseline_act_collab, y_act_cont, pid_act)
+ACT_COLLAB["baseline_3class"]     = tt_baseline_classify(
+    baseline_act_collab, y_act_3, tr_act3, te_act3, multiclass=True)
+ACT_COLLAB["baseline_lof_wt"]     = tt_baseline_classify(
+    baseline_act_collab, y_act_3, tr_lw, te_lw, multiclass=False)
+ACT_COLLAB["baseline_gof_wt"]     = tt_baseline_classify(
+    baseline_act_collab, y_act_3, tr_gw, te_gw, multiclass=False)
+ACT_COLLAB["baseline_regression"] = tt_baseline_regress(
+    baseline_act_collab, y_act_cont, act_train_idx, act_test_idx)
 print("Done.")
 
 # %% [markdown]
@@ -562,31 +522,31 @@ print("=== Activity: D5 TopKSAE (8192-dim Z) ===")
 
 ACT_D5 = {}
 
-ACT_D5["3class"] = run_grid(
-    Z_d5_act[idx_act3], y_act_3[idx_act3], pid_act3, C_VALUES,
+ACT_D5["3class"] = run_tt_grid(
+    Z_d5_act, y_act_3, tr_act3, te_act3, C_VALUES,
     task="classify", multiclass=True, label="D5 act 3-class")
 
-ACT_D5["lof_vs_wt"] = run_grid(
-    Z_d5_act[mask_lw], y_act_3[mask_lw], pid_act[mask_lw], C_VALUES,
+ACT_D5["lof_vs_wt"] = run_tt_grid(
+    Z_d5_act, y_act_3, tr_lw, te_lw, C_VALUES,
     task="classify", multiclass=False, label="D5 LoF/wt")
 
-ACT_D5["gof_vs_wt"] = run_grid(
-    Z_d5_act[mask_gw], y_act_3[mask_gw], pid_act[mask_gw], C_VALUES,
+ACT_D5["gof_vs_wt"] = run_tt_grid(
+    Z_d5_act, y_act_3, tr_gw, te_gw, C_VALUES,
     task="classify", multiclass=False, label="D5 GoF/wt")
 
-ACT_D5["regression"] = run_grid(
-    Z_d5_act, y_act_cont, pid_act, C_VALUES,
+ACT_D5["regression"] = run_tt_grid(
+    Z_d5_act, y_act_cont, act_train_idx, act_test_idx, C_VALUES,
     task="regress", label="D5 act regression")
 
 print("  Baseline …")
-ACT_D5["baseline_3class"]     = lopo_baseline_classify(
-    baseline_act_d5[idx_act3], y_act_3[idx_act3], pid_act3, multiclass=True)
-ACT_D5["baseline_lof_wt"]     = lopo_baseline_classify(
-    baseline_act_d5[mask_lw], y_act_3[mask_lw], pid_act[mask_lw], multiclass=False)
-ACT_D5["baseline_gof_wt"]     = lopo_baseline_classify(
-    baseline_act_d5[mask_gw], y_act_3[mask_gw], pid_act[mask_gw], multiclass=False)
-ACT_D5["baseline_regression"] = lopo_baseline_regress(
-    baseline_act_d5, y_act_cont, pid_act)
+ACT_D5["baseline_3class"]     = tt_baseline_classify(
+    baseline_act_d5, y_act_3, tr_act3, te_act3, multiclass=True)
+ACT_D5["baseline_lof_wt"]     = tt_baseline_classify(
+    baseline_act_d5, y_act_3, tr_lw, te_lw, multiclass=False)
+ACT_D5["baseline_gof_wt"]     = tt_baseline_classify(
+    baseline_act_d5, y_act_3, tr_gw, te_gw, multiclass=False)
+ACT_D5["baseline_regression"] = tt_baseline_regress(
+    baseline_act_d5, y_act_cont, act_train_idx, act_test_idx)
 print("Done.")
 
 # %% [markdown]
@@ -599,28 +559,34 @@ def _fmt(d, key, fmt=".3f"):
     return format(v, fmt) if not np.isnan(float(v)) else "—"
 
 def print_classify_table(grid, baseline, task_names, c_values):
-    print(f"\n{'Task':<18} {'C':>6} {'BalAcc':>8} {'AUC':>8} │ {'Baseline BalAcc':>16} {'Baseline AUC':>12}")
-    print("─" * 80)
-    for task, bl_key in task_names:
-        bl = baseline.get(bl_key, {})
-        for i, C in enumerate(c_values):
-            r = grid.get(task, {}).get(C, {})
-            pfx = f"{task:<18}" if i == 0 else " " * 18
-            blfmt = (f"{_fmt(bl,'test_balanced_acc'):>16} {_fmt(bl,'test_auc'):>12}"
-                     if i == 0 else " " * 29)
-            print(f"{pfx} {C:>6} {_fmt(r,'test_balanced_acc'):>8} {_fmt(r,'test_auc'):>8} │ {blfmt}")
-
-def print_regress_table(grid, baseline, task_names, c_values):
-    print(f"\n{'Task':<18} {'C':>6} {'Test R²':>9} {'Test MSE':>10} │ {'Baseline R²':>12} {'Baseline MSE':>13}")
+    print(f"\n{'Task':<18} {'C':>6} {'BalAcc':>8} {'AUC':>8} {'Nonzero':>8} │ {'BL BalAcc':>10} {'BL AUC':>8}")
     print("─" * 85)
     for task, bl_key in task_names:
         bl = baseline.get(bl_key, {})
         for i, C in enumerate(c_values):
             r = grid.get(task, {}).get(C, {})
             pfx = f"{task:<18}" if i == 0 else " " * 18
-            blfmt = (f"{_fmt(bl,'test_r2'):>12} {_fmt(bl,'test_mse'):>13}"
-                     if i == 0 else " " * 26)
-            print(f"{pfx} {C:>6} {_fmt(r,'test_r2'):>9} {_fmt(r,'test_mse'):>10} │ {blfmt}")
+            nnz = r.get("n_nonzero_coef", "—")
+            nnz_fmt = f"{nnz:>8}" if isinstance(nnz, int) else f"{'—':>8}"
+            blfmt = (f"{_fmt(bl,'test_balanced_acc'):>10} {_fmt(bl,'test_auc'):>8}"
+                     if i == 0 else " " * 19)
+            print(f"{pfx} {C:>6} {_fmt(r,'test_balanced_acc'):>8} {_fmt(r,'test_auc'):>8}"
+                  f"{nnz_fmt} │ {blfmt}")
+
+def print_regress_table(grid, baseline, task_names, c_values):
+    print(f"\n{'Task':<18} {'C':>6} {'Test R²':>9} {'MSE':>8} {'Nonzero':>8} │ {'BL R²':>7} {'BL MSE':>8}")
+    print("─" * 85)
+    for task, bl_key in task_names:
+        bl = baseline.get(bl_key, {})
+        for i, C in enumerate(c_values):
+            r = grid.get(task, {}).get(C, {})
+            pfx = f"{task:<18}" if i == 0 else " " * 18
+            nnz = r.get("n_nonzero_coef", "—")
+            nnz_fmt = f"{nnz:>8}" if isinstance(nnz, int) else f"{'—':>8}"
+            blfmt = (f"{_fmt(bl,'test_r2'):>7} {_fmt(bl,'test_mse'):>8}"
+                     if i == 0 else " " * 16)
+            print(f"{pfx} {C:>6} {_fmt(r,'test_r2'):>9} {_fmt(r,'test_mse'):>8}"
+                  f"{nnz_fmt} │ {blfmt}")
 
 # ── Stability ─────────────────────────────────────────────────────────────────
 print("=" * 80)
@@ -678,7 +644,7 @@ print_regress_table(
 # %% [markdown]
 # ## 10. Top Feature Weights (Interpretation)
 #
-# For each model × dataset, pick the best C value (highest balanced accuracy on 3-class)
+# For each model × dataset, pick the best C value (highest AUC on 3-class)
 # and plot the top features by |mean coefficient|.
 # Positive coefficient: feature activation → destab/GoF class.
 # Negative coefficient: feature activation → stab/LoF class.
@@ -705,7 +671,7 @@ def plot_top_features(coef, n_top, title, out_path=None):
 
 # ─ Stability: Collab SAE ─────────────────────────────────────────────────────
 best_C_stab_collab = max(C_VALUES,
-    key=lambda C: STAB_COLLAB["3class"].get(C, {}).get("test_balanced_acc", -1))
+    key=lambda C: STAB_COLLAB["3class"].get(C, {}).get("test_auc", -1))
 coef_stab_collab = STAB_COLLAB["3class"][best_C_stab_collab].get("coef_mean")
 if coef_stab_collab is not None:
     plot_top_features(coef_stab_collab, N_TOP_FEATURES,
@@ -715,7 +681,7 @@ if coef_stab_collab is not None:
 
 # ─ Stability: D5 ─────────────────────────────────────────────────────────────
 best_C_stab_d5 = max(C_VALUES,
-    key=lambda C: STAB_D5["3class"].get(C, {}).get("test_balanced_acc", -1))
+    key=lambda C: STAB_D5["3class"].get(C, {}).get("test_auc", -1))
 coef_stab_d5 = STAB_D5["3class"][best_C_stab_d5].get("coef_mean")
 if coef_stab_d5 is not None:
     plot_top_features(coef_stab_d5, N_TOP_FEATURES,
@@ -725,7 +691,7 @@ if coef_stab_d5 is not None:
 
 # ─ Activity: Collab SAE ───────────────────────────────────────────────────────
 best_C_act_collab = max(C_VALUES,
-    key=lambda C: ACT_COLLAB["3class"].get(C, {}).get("test_balanced_acc", -1))
+    key=lambda C: ACT_COLLAB["3class"].get(C, {}).get("test_auc", -1))
 coef_act_collab = ACT_COLLAB["3class"][best_C_act_collab].get("coef_mean")
 if coef_act_collab is not None:
     plot_top_features(coef_act_collab, N_TOP_FEATURES,
@@ -735,7 +701,7 @@ if coef_act_collab is not None:
 
 # ─ Activity: D5 ──────────────────────────────────────────────────────────────
 best_C_act_d5 = max(C_VALUES,
-    key=lambda C: ACT_D5["3class"].get(C, {}).get("test_balanced_acc", -1))
+    key=lambda C: ACT_D5["3class"].get(C, {}).get("test_auc", -1))
 coef_act_d5 = ACT_D5["3class"][best_C_act_d5].get("coef_mean")
 if coef_act_d5 is not None:
     plot_top_features(coef_act_d5, N_TOP_FEATURES,
@@ -744,11 +710,11 @@ if coef_act_d5 is not None:
         OUT_DIR / "probe_act_d5_top_features.png")
 
 # %% [markdown]
-# ## 11. Balanced Accuracy vs C Curve
+# ## 11. AUC vs C Curve
 
 # %%
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-fig.suptitle("LOPO Balanced Accuracy vs L1 Regularization (C)", fontsize=12, fontweight="bold")
+fig.suptitle("AUC vs L1 Regularization (C)", fontsize=12, fontweight="bold")
 
 configs = [
     (STAB_COLLAB, "Stability — Collab SAE ΔZ",  axes[0, 0],
@@ -769,20 +735,20 @@ task_labels  = ["3-class", "stab/neut (or LoF/wt)", "dest/neut (or GoF/wt)"]
 
 for grid, title, ax, tasks in configs:
     for (task, bl_key), color, tlabel in zip(tasks, colors_tasks, task_labels):
-        vals = [grid.get(task, {}).get(C, {}).get("test_balanced_acc", np.nan)
+        vals = [grid.get(task, {}).get(C, {}).get("test_auc", np.nan)
                 for C in C_VALUES]
         ax.plot(C_VALUES, vals, marker="o", color=color, label=tlabel)
-        bl = grid.get(bl_key, {}).get("test_balanced_acc", np.nan)
+        bl = grid.get(bl_key, {}).get("test_auc", np.nan)
         if not np.isnan(float(bl)):
             ax.axhline(bl, linestyle="--", color=color, alpha=0.5, lw=0.9)
     ax.set_xscale("log")
     ax.set_xlabel("C (1/λ)  — higher = less regularization", fontsize=9)
-    ax.set_ylabel("Balanced Accuracy (LOPO)", fontsize=9)
+    ax.set_ylabel("AUC", fontsize=9)
     ax.set_title(title, fontsize=10)
     ax.legend(fontsize=7)
 
 plt.tight_layout()
-plt.savefig(OUT_DIR / "probe_balanced_acc_vs_C.png", dpi=150, bbox_inches="tight")
+plt.savefig(OUT_DIR / "probe_auc_vs_C.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
@@ -812,6 +778,7 @@ for model_name, grid, tasks in [
                 test_auc          = r.get("test_auc", np.nan),
                 test_r2           = r.get("test_r2", np.nan),
                 test_mse          = r.get("test_mse", np.nan),
+                n_nonzero_coef    = r.get("n_nonzero_coef", np.nan),
                 baseline_bal_acc  = bl.get("test_balanced_acc", np.nan),
                 baseline_auc      = bl.get("test_auc", np.nan),
                 baseline_r2       = bl.get("test_r2", np.nan),
