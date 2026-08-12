@@ -61,6 +61,7 @@ MODEL_CONFIGS = [
     ("concat_ef4_k128", "concat", 2048, 4, 128),  # matches D5 architecture
     ("concat_ef4_k64",  "concat", 2048, 4,  64),  # sparser
     ("concat_ef1_k128", "concat", 2048, 1, 128),  # smaller dict
+    ("diff_ef4_k256",   "diff",   1024, 4, 256),  # diff, EF=4, K=256 (6.25% active)
     ("diff_ef4_k64",    "diff",   1024, 4,  64),  # matches D7 architecture
     ("diff_ef4_k32",    "diff",   1024, 4,  32),  # sparser
     ("diff_ef1_k64",    "diff",   1024, 1,  64),  # smaller dict

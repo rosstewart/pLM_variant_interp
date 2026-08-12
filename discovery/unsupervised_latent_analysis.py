@@ -50,7 +50,7 @@ GNOMAD_VT_CACHE = OUT_DIR / "gnomad_vt.npy"
 HGMD_WT_CACHE   = OUT_DIR / "hgmd_wt.npy"
 HGMD_VT_CACHE   = OUT_DIR / "hgmd_vt.npy"
 
-PATCH_CSV   = SB / "activation_patching_results_v2.csv"
+PATCH_CSV   = INTD / "patching_results/activation_patching_results_v2.csv"
 MEGA_PKL    = "/data/ross/ppi_lossgain/interaction_loss/megascale_preprocessed/preprocessed.pkl"
 ACT_CACHE   = Path("/data/ross/interp/activity_sae_cache")
 ACT_CSV     = Path("/data/ross/assay_calibration/labelseq_dataframe_processed.csv.gz")
@@ -60,6 +60,7 @@ BATCH  = 4096
 
 MODEL_CONFIGS = [
     ("concat_ef1_k128", "concat", 2048, 1, 128),
+    ("diff_ef4_k256",   "diff",   1024, 4, 256),
 ]
 
 # ── TopKSAE ────────────────────────────────────────────────────────────────────
@@ -112,8 +113,8 @@ print("=" * 70)
 
 # ── ClinVar (already cached as concat features) ──────────────────────────────
 print("ClinVar: loading from precomputed cache …")
-cv_feats  = np.load(SB / "clinvar_feats.npy")        # (N_cv, 2048) concat(WT, VT)
-cv_labels = np.load(SB / "clinvar_labels.npy")        # 0=benign, 1=pathogenic
+cv_feats  = np.load(INTD / "clinvar_feats.npy")        # (N_cv, 2048) concat(WT, VT)
+cv_labels = np.load(INTD / "clinvar_labels.npy")       # 0=benign, 1=pathogenic
 print(f"  ClinVar: {len(cv_feats):,} variants  (path={cv_labels.sum():,}  ben={(cv_labels==0).sum():,})")
 
 # Derive WT / VT from concat features

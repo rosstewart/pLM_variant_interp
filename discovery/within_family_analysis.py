@@ -15,7 +15,7 @@ available (COL1A1 only in the PPI-complex gnomAD H5).
 
 Outputs → /data/ross/interp/latent_analysis/validation/within_family/
 """
-import sys, re, time
+import sys, re, time, argparse
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +30,11 @@ from shared_infrastructure import (
     load_decoder, load_clinvar_data, load_hgmd_gnomad,
     reconstruct_clinvar_variant_keys, run_disease_kmeans,
 )
+
+_ap = argparse.ArgumentParser(description="Within-family latent specificity analysis")
+_ap.add_argument("--name", default=DEFAULT_NAME,
+                 help="SAE model name (default: %(default)s)")
+_args, _ = _ap.parse_known_args()
 
 OUT = LA / "validation" / "within_family"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -290,12 +295,13 @@ def cross_cluster_mechanism(Z_cv_path_dense, cluster_ids_cv, cv_prots, label="TP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    t0 = time.time()
+    t0   = time.time()
+    name = _args.name
 
-    print("Loading data …", flush=True)
-    _, _, W_dec, b_dec = load_decoder()
-    Z_cv, labels, _ = load_clinvar_data()
-    Z_hg, Z_gn      = load_hgmd_gnomad()
+    print(f"Loading data … (model={name})", flush=True)
+    _, _, W_dec, b_dec = load_decoder(name)
+    Z_cv, labels, _    = load_clinvar_data(name)
+    Z_hg, Z_gn         = load_hgmd_gnomad(name)
 
     path_mask  = labels == 1
     Z_cv_path  = Z_cv[path_mask]

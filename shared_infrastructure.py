@@ -41,7 +41,18 @@ ACT_CSV   = Path("/data/ross/assay_calibration/labelseq_dataframe_processed.csv.
 # Legacy read-only path (existing cached Z and CSV outputs live here; do not write new files here)
 LA_LEGACY = Path("/data/ross/ppi_lossgain/interaction_loss/latent_analysis")
 
-# ── Default model config ──────────────────────────────────────────────────────
+# ── Model registry ───────────────────────────────────────────────────────────
+# (name, input_type, in_dim, ef, k)
+MODEL_REGISTRY = {
+    "concat_ef1_k128": ("concat", 2048, 1, 128),
+    "concat_ef4_k128": ("concat", 2048, 4, 128),
+    "concat_ef4_k64":  ("concat", 2048, 4,  64),
+    "diff_ef1_k64":    ("diff",   1024, 1,  64),
+    "diff_ef4_k32":    ("diff",   1024, 4,  32),
+    "diff_ef4_k64":    ("diff",   1024, 4,  64),
+    "diff_ef4_k256":   ("diff",   1024, 4, 256),
+}
+
 DEFAULT_NAME  = "concat_ef1_k128"
 DEFAULT_IN_DIM, DEFAULT_EF, DEFAULT_K = 2048, 1, 128
 RANDOM_SEED   = 42
@@ -92,23 +103,35 @@ class TopKSAE(nn.Module):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def load_decoder(name: str = DEFAULT_NAME,
-                 in_dim: int = DEFAULT_IN_DIM,
-                 ef: int = DEFAULT_EF,
-                 k: int = DEFAULT_K):
+                 in_dim: int = None,
+                 ef: int = None,
+                 k: int = None):
     """Load SAE checkpoint and return decoder components.
+
+    For concat models (in_dim=2048): W_dec_diff = W_dec[1024:] - W_dec[:1024],
+    projecting latents into the mutation-effect (VT-WT) reconstruction space.
+
+    For diff models (in_dim=1024): the decoder already operates in diff space,
+    so W_dec_diff = W_dec and b_dec_diff = b_dec.
 
     Returns
     -------
     W_dec_diff : np.ndarray (1024, dict_size) float32
-        VT-minus-WT decoder weight matrix: W_dec[1024:] - W_dec[:1024].
-        Projects SAE latents into the mutation-effect (diff) reconstruction space.
     b_dec_diff : np.ndarray (1024,) float32
-        Corresponding bias difference: b_dec[1024:] - b_dec[:1024].
-    W_dec : np.ndarray (in_dim, dict_size) float32
-        Full decoder weight matrix.
-    b_dec : np.ndarray (in_dim,) float32
-        Full decoder bias.
+    W_dec      : np.ndarray (in_dim, dict_size) float32
+    b_dec      : np.ndarray (in_dim,) float32
     """
+    if name in MODEL_REGISTRY:
+        input_type, _in_dim, _ef, _k = MODEL_REGISTRY[name]
+        in_dim = in_dim or _in_dim
+        ef     = ef     or _ef
+        k      = k      or _k
+    else:
+        input_type = "concat" if name.startswith("concat") else "diff"
+        in_dim = in_dim or DEFAULT_IN_DIM
+        ef     = ef     or DEFAULT_EF
+        k      = k      or DEFAULT_K
+
     ckpt_path = COMBINED / f"combined_{name}.pt"
     model = TopKSAE(in_dim, ef, k)
     model.load_state_dict(torch.load(str(ckpt_path), map_location="cpu"))
@@ -118,9 +141,15 @@ def load_decoder(name: str = DEFAULT_NAME,
     b_dec = model.b_dec.detach().numpy().astype(np.float32)           # (in_dim,)
     del model
 
-    half = in_dim // 2
-    W_dec_diff = (W_dec[half:] - W_dec[:half]).astype(np.float32)    # (half, dict_size)
-    b_dec_diff = (b_dec[half:] - b_dec[:half]).astype(np.float32)    # (half,)
+    if input_type == "diff":
+        # decoder already in VT-WT diff space
+        W_dec_diff = W_dec
+        b_dec_diff = b_dec
+    else:
+        half = in_dim // 2
+        W_dec_diff = (W_dec[half:] - W_dec[:half]).astype(np.float32)
+        b_dec_diff = (b_dec[half:] - b_dec[:half]).astype(np.float32)
+
     return W_dec_diff, b_dec_diff, W_dec, b_dec
 
 

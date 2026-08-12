@@ -17,7 +17,7 @@ Outputs → /data/ross/interp/latent_analysis/
 """
 
 import warnings; warnings.filterwarnings("ignore")
-import re, pickle
+import argparse, re, pickle
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -43,9 +43,24 @@ ACT_CSV    = Path("/data/ross/assay_calibration/labelseq_dataframe_processed.csv
 MEGA_PKL   = "/data/ross/ppi_lossgain/interaction_loss/megascale_preprocessed/preprocessed.pkl"
 PATCH_CSV  = SB / "activation_patching_results_v2.csv"
 
-NAME = "concat_ef1_k128"
-IN_DIM, EF, K = 2048, 1, 128
-DICT_SIZE = EF * IN_DIM  # 2048
+_MODEL_REGISTRY = {
+    "concat_ef1_k128": (2048, 1, 128),
+    "concat_ef4_k128": (2048, 4, 128),
+    "concat_ef4_k64":  (2048, 4,  64),
+    "diff_ef4_k256":   (1024, 4, 256),
+    "diff_ef4_k64":    (1024, 4,  64),
+    "diff_ef4_k32":    (1024, 4,  32),
+    "diff_ef1_k64":    (1024, 1,  64),
+}
+
+_ap = argparse.ArgumentParser(description="Disease mechanism clustering")
+_ap.add_argument("--name", default="concat_ef1_k128",
+                 help="SAE model name (default: concat_ef1_k128)")
+_args, _ = _ap.parse_known_args()
+
+NAME = _args.name
+IN_DIM, EF, K = _MODEL_REGISTRY.get(NAME, (2048, 1, 128))
+DICT_SIZE = EF * IN_DIM
 
 N_CLUSTERS   = 50
 MOD_THRESH   = 0.25     # fraction of module latents that must be active for "module fires"
