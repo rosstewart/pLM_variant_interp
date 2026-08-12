@@ -1,7 +1,13 @@
-# MutPred-PPI: Sparse Bottleneck / SAE Interpretability
+# ProtT5 SAE Interpretability
 
-Interpretability analyses for the MutPred-PPI model using Sparse Autoencoders (SAEs).
-SAE latents are used to discover and validate disease mechanisms in an unsupervised way.
+Sparse Autoencoder (SAE) interpretability for ProtT5 variant embeddings.
+Trains TopK SAEs on wild-type and mutant ProtT5 representations of clinical and
+population variants, then uses the learned latents to discover and validate disease
+mechanisms in an unsupervised way.
+
+Data: ClinVar pathogenic/benign + gnomAD + HGMD variants, already processed as
+ProtT5 embeddings (WT and mutant). These overlap with data used in separate analyses
+in the MutPred-PPI paper but this project is independent of that model.
 
 ## Setup
 

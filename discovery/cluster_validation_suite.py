@@ -725,7 +725,7 @@ SECTION_MAP = {
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cluster validation suite for MutPred-PPI SAE disease clusters")
+        description="Cluster validation suite for ProtT5 SAE disease mechanism clusters")
     parser.add_argument(
         "--sections", default="0B,1,2,3,4,5",
         help="Comma-separated list of sections to run, e.g. '1,2,5' (default: all)")

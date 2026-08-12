@@ -1,6 +1,6 @@
 """
 shared_infrastructure.py — Common data loaders, model definitions, and utilities
-for the MutPred-PPI sparse bottleneck / SAE interpretability pipeline.
+for the ProtT5 SAE interpretability pipeline.
 
 All scripts in sparse_bottleneck/ should import from here instead of duplicating
 class definitions and path constants.
