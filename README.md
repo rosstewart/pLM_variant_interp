@@ -16,10 +16,16 @@ conda activate ppi
 # All outputs → /data/ross/interp/  (never /data/ross/ppi_lossgain/interaction_loss/)
 ```
 
+See [RESULTS.md](RESULTS.md) for a running record of all analysis results (probe AUCs,
+cluster validation metrics, within-family enrichments).
+
+---
+
 ## Repository layout
 
 ```
 shared_infrastructure.py       ← common loaders, TopKSAE, probe training (imported by discovery/)
+RESULTS.md                     ← running record of all analysis results
 training/
   train_combined_topksae.py    ← SAE training
 caching/
