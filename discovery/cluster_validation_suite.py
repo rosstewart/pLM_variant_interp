@@ -301,6 +301,9 @@ def section_1(d: dict):
     print("\n" + "="*70)
     print("Section 1: Probe score distributions per cluster")
     print("="*70, flush=True)
+    if not d["probes"]:
+        print("  [skip] no probes available — phenotype cache missing for this model")
+        return
 
     W_dec_diff  = d["W_dec_diff"]
     b_dec_diff  = d["b_dec_diff"]
@@ -359,6 +362,7 @@ def section_2(d: dict):
     cluster_ids_cv = d["cluster_ids_cv"]
     W_dec_diff  = d["W_dec_diff"]
     probes      = d["probes"]
+    _has_probes = bool(probes)
 
     Z_dense = np.asarray(Z_cv_path.todense(), dtype=np.float32)
     n_lats  = Z_dense.shape[1]
@@ -384,14 +388,15 @@ def section_2(d: dict):
             # Mean over in-cluster and out-of-cluster variants, for each probe task
             w_lat = W_dec_diff[:, lat]   # (half_dim,)
             causal = {}
-            for task, (pos_cls, neg_cls, ds) in PROBE_TASKS.items():
-                clf     = probes[task]
-                coef    = clf.coef_[0]    # (half_dim,)
-                delta_w = float(coef @ w_lat)  # scalar: change in linear score per unit activation
-                causal[f"delta_{task}_in"]  = delta_w * float(Z_dense[in_mask,  lat].mean())
-                causal[f"delta_{task}_out"] = delta_w * float(Z_dense[out_mask, lat].mean())
-                causal[f"causal_spec_{task}"] = (causal[f"delta_{task}_in"]
-                                                 - causal[f"delta_{task}_out"])
+            if _has_probes:
+                for task, (pos_cls, neg_cls, ds) in PROBE_TASKS.items():
+                    clf     = probes[task]
+                    coef    = clf.coef_[0]    # (half_dim,)
+                    delta_w = float(coef @ w_lat)
+                    causal[f"delta_{task}_in"]  = delta_w * float(Z_dense[in_mask,  lat].mean())
+                    causal[f"delta_{task}_out"] = delta_w * float(Z_dense[out_mask, lat].mean())
+                    causal[f"causal_spec_{task}"] = (causal[f"delta_{task}_in"]
+                                                     - causal[f"delta_{task}_out"])
 
             rows.append({
                 "cluster": k, "latent": int(lat),

@@ -41,7 +41,7 @@ ACT_CACHE  = Path("/data/ross/interp/activity_sae_cache")
 COMBINED_CACHE = Path("/data/ross/interp/combined_sae_cache")
 ACT_CSV    = Path("/data/ross/assay_calibration/labelseq_dataframe_processed.csv.gz")
 MEGA_PKL   = "/data/ross/ppi_lossgain/interaction_loss/megascale_preprocessed/preprocessed.pkl"
-PATCH_CSV  = SB / "activation_patching_results_v2.csv"
+PATCH_CSV  = Path("/data/ross/interp/patching_results/activation_patching_results_v2.csv")
 
 _MODEL_REGISTRY = {
     "concat_ef1_k128": (2048, 1, 128),
@@ -87,12 +87,18 @@ print("Loading SAE decoder …")
 model = TopKSAE(IN_DIM, EF, K)
 model.load_state_dict(torch.load(str(COMBINED / f"combined_{NAME}.pt"), map_location="cpu"))
 model.eval()
-W_dec = model.decoder.weight.detach().numpy().astype(np.float32)   # (2048, 2048)
+W_dec = model.decoder.weight.detach().numpy().astype(np.float32)
 b_dec = model.b_dec.detach().numpy().astype(np.float32)
-# diff decoder: effect on VT-WT recon space
-W_dec_diff = (W_dec[1024:] - W_dec[:1024]).astype(np.float32)      # (1024, 2048)
-b_dec_diff = (b_dec[1024:] - b_dec[:1024]).astype(np.float32)
 del model
+# For concat models: extract VT-WT component from the two decoder halves.
+# For diff models: decoder already operates in VT-WT space — use it directly.
+if NAME.startswith("diff"):
+    W_dec_diff = W_dec
+    b_dec_diff = b_dec
+else:
+    half = IN_DIM // 2
+    W_dec_diff = (W_dec[half:] - W_dec[:half]).astype(np.float32)
+    b_dec_diff = (b_dec[half:] - b_dec[:half]).astype(np.float32)
 
 # ── Load source Z and labels ───────────────────────────────────────────────────
 print("Loading Z matrices …")
@@ -100,8 +106,8 @@ Z_cv = sp.load_npz(str(LA / f"z_cv_{NAME}.npz"))   # (227189, 2048)
 Z_gn = sp.load_npz(str(LA / f"z_gn_{NAME}.npz"))   # (599100, 2048)
 Z_hg = sp.load_npz(str(LA / f"z_hg_{NAME}.npz"))   # (13390,  2048)
 
-cv_labels  = np.load(SB / "clinvar_labels.npy")      # 0=benign, 1=pathogenic
-cv_prot_ids = np.load(SB / "clinvar_protein_ids.npy", allow_pickle=True)
+cv_labels  = np.load(Path("/data/ross/interp/clinvar_labels.npy"))      # 0=benign, 1=pathogenic
+cv_prot_ids = np.load(Path("/data/ross/interp/clinvar_protein_ids.npy"), allow_pickle=True)
 
 path_mask = cv_labels == 1
 ben_mask  = cv_labels == 0
@@ -164,8 +170,20 @@ y_act[[i for i,b in enumerate(bins) if b=="wt_like"]] = 1
 y_act[[i for i,b in enumerate(bins) if b=="GoF"]]     = 2
 act_mask = y_act >= 0
 
-Z_stab = sp.load_npz(str(COMBINED_CACHE / f"z_stab_{NAME}.npz"))
-Z_act  = sp.load_npz(str(COMBINED_CACHE / f"z_act_{NAME}.npz"))
+_stab_path = COMBINED_CACHE / f"z_stab_{NAME}.npz"
+_act_path  = COMBINED_CACHE / f"z_act_{NAME}.npz"
+HAS_PHENO  = _stab_path.exists() and _act_path.exists()
+if HAS_PHENO:
+    Z_stab = sp.load_npz(str(_stab_path))
+    Z_act  = sp.load_npz(str(_act_path))
+else:
+    print(f"  [warn] phenotype cache not found for {NAME} — skipping phenotype linkage")
+    Z_stab = sp.csr_matrix((0, DICT_SIZE))
+    Z_act  = sp.csr_matrix((0, DICT_SIZE))
+    y_stab = np.array([], dtype=np.int8)
+    y_act  = np.array([], dtype=np.int8)
+    stab_mask = np.array([], dtype=bool)
+    act_mask  = np.array([], dtype=bool)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -200,11 +218,15 @@ y_stab_lab = y_stab[stab_mask]
 y_act_lab  = y_act[act_mask]
 
 # Assign stability/activity variants to nearest centroid
-print("Assigning stability/activity variants to clusters …")
-Z_stab_norm = normalize(Z_stab[stab_mask], norm="l2")
-Z_act_norm  = normalize(Z_act[act_mask],   norm="l2")
-stab_cluster_ids = km.predict(Z_stab_norm)
-act_cluster_ids  = km.predict(Z_act_norm)
+if HAS_PHENO:
+    print("Assigning stability/activity variants to clusters …")
+    Z_stab_norm = normalize(Z_stab[stab_mask], norm="l2")
+    Z_act_norm  = normalize(Z_act[act_mask],   norm="l2")
+    stab_cluster_ids = km.predict(Z_stab_norm)
+    act_cluster_ids  = km.predict(Z_act_norm)
+else:
+    stab_cluster_ids = np.array([], dtype=np.int32)
+    act_cluster_ids  = np.array([], dtype=np.int32)
 
 cluster_rows = []
 for c in range(N_CLUSTERS):
@@ -337,35 +359,40 @@ print("\n" + "="*70)
 print("Path C (revised): Pathomechanism module annotation")
 print("="*70)
 
-df_mod_raw = pd.read_csv(LA / f"latent_modules_{NAME}.csv")
+_mod_csv = LA / f"latent_modules_{NAME}.csv"
+if not _mod_csv.exists():
+    print(f"  [skip] {_mod_csv.name} not found — run unsupervised_latent_analysis.py with PATH_C_MODELS including {NAME}")
+    import sys; sys.exit(0)
+
+df_mod_raw = pd.read_csv(_mod_csv)
 
 # ── Train recon probes for each task (needed for aggregate decoder effect) ────
-print("Training recon probes …")
 recon_coefs = {}
 with_intercept = {}
-
-PROBE_TASKS = {
-    "destab_vs_neut": (Z_stab[stab_mask], y_stab_lab, 2, 1),
-    "stab_vs_neut":   (Z_stab[stab_mask], y_stab_lab, 0, 1),
-    "gof_vs_wt":      (Z_act[act_mask],   y_act_lab,  2, 1),
-    "lof_vs_wt":      (Z_act[act_mask],   y_act_lab,  0, 1),
-}
-for task, (Z_t, y_t, pos_cls, neg_cls) in PROBE_TASKS.items():
-    # recon space: Z @ W_dec_diff.T + b_dec_diff
-    mask_t  = (y_t == pos_cls) | (y_t == neg_cls)
-    Z_bin_t = Z_t[mask_t]
-    y_bin   = (y_t[mask_t] == pos_cls).astype(int)
-    xh      = np.asarray(Z_bin_t.dot(W_dec_diff.T), dtype=np.float32) + b_dec_diff
-    classes = np.unique(y_bin)
-    sign    = 1.0 if pos_cls > neg_cls else -1.0
-    clf = LogisticRegression(penalty="l1", C=0.1, solver="liblinear",
-                             class_weight="balanced", max_iter=1000, tol=1e-4)
-    clf.fit(xh, y_bin)
-    recon_coefs[task]   = clf.coef_[0].astype(np.float64)
-    with_intercept[task] = float(clf.intercept_[0])
-    pred = clf.predict_proba(xh)[:,1]
-    auc  = roc_auc_score(y_bin, pred)
-    print(f"  {task}: AUC={auc:.4f}")
+if HAS_PHENO:
+    print("Training recon probes …")
+    PROBE_TASKS = {
+        "destab_vs_neut": (Z_stab[stab_mask], y_stab_lab, 2, 1),
+        "stab_vs_neut":   (Z_stab[stab_mask], y_stab_lab, 0, 1),
+        "gof_vs_wt":      (Z_act[act_mask],   y_act_lab,  2, 1),
+        "lof_vs_wt":      (Z_act[act_mask],   y_act_lab,  0, 1),
+    }
+    for task, (Z_t, y_t, pos_cls, neg_cls) in PROBE_TASKS.items():
+        mask_t  = (y_t == pos_cls) | (y_t == neg_cls)
+        Z_bin_t = Z_t[mask_t]
+        y_bin   = (y_t[mask_t] == pos_cls).astype(int)
+        xh      = np.asarray(Z_bin_t.dot(W_dec_diff.T), dtype=np.float32) + b_dec_diff
+        sign    = 1.0 if pos_cls > neg_cls else -1.0
+        clf = LogisticRegression(penalty="l1", C=0.1, solver="liblinear",
+                                 class_weight="balanced", max_iter=1000, tol=1e-4)
+        clf.fit(xh, y_bin)
+        recon_coefs[task]   = clf.coef_[0].astype(np.float64)
+        with_intercept[task] = float(clf.intercept_[0])
+        pred = clf.predict_proba(xh)[:,1]
+        auc  = roc_auc_score(y_bin, pred)
+        print(f"  {task}: AUC={auc:.4f}")
+else:
+    print("  [skip] phenotype probe training — no cache for this model")
 
 
 # ── Per-module annotation ──────────────────────────────────────────────────────
@@ -404,20 +431,21 @@ for _, row in df_mod_raw.iterrows():
 
     # Phenotype linkage — mean fires per phenotype class
     pheno_link = {}
-    for task, (Z_t_csc, y_t) in [
-        ("destab", (Z_stab_csc, y_stab_lab)),
-        ("stab",   (Z_stab_csc, y_stab_lab)),
-        ("gof",    (Z_act_csc,  y_act_lab)),
-        ("lof",    (Z_act_csc,  y_act_lab)),
-    ]:
-        cls = {"destab":2,"stab":0,"gof":2,"lof":0}[task]
-        neg = {"destab":1,"stab":1,"gof":1,"lof":1}[task]
-        idx_pos = np.where(y_t == cls)[0]
-        idx_neg = np.where(y_t == neg)[0]
-        Z_t_mod = np.asarray(Z_t_csc[:, mod_lats].todense())
-        rate_pos = float((Z_t_mod[idx_pos] > 0).mean()) if len(idx_pos) else 0.0
-        rate_neg = float((Z_t_mod[idx_neg] > 0).mean()) if len(idx_neg) else 0.0
-        pheno_link[f"pheno_{task}_vs_ctrl"] = round(rate_pos - rate_neg, 5)
+    if HAS_PHENO:
+        for task, (Z_t_csc, y_t) in [
+            ("destab", (Z_stab_csc, y_stab_lab)),
+            ("stab",   (Z_stab_csc, y_stab_lab)),
+            ("gof",    (Z_act_csc,  y_act_lab)),
+            ("lof",    (Z_act_csc,  y_act_lab)),
+        ]:
+            cls = {"destab":2,"stab":0,"gof":2,"lof":0}[task]
+            neg = {"destab":1,"stab":1,"gof":1,"lof":1}[task]
+            idx_pos = np.where(y_t == cls)[0]
+            idx_neg = np.where(y_t == neg)[0]
+            Z_t_mod = np.asarray(Z_t_csc[:, mod_lats].todense())
+            rate_pos = float((Z_t_mod[idx_pos] > 0).mean()) if len(idx_pos) else 0.0
+            rate_neg = float((Z_t_mod[idx_neg] > 0).mean()) if len(idx_neg) else 0.0
+            pheno_link[f"pheno_{task}_vs_ctrl"] = round(rate_pos - rate_neg, 5)
 
     # Aggregate decoder effect on each recon probe
     decoder_effects = {}

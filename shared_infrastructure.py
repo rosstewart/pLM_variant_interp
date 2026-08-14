@@ -171,8 +171,8 @@ def load_clinvar_data(name: str = DEFAULT_NAME):
     if not z_path.exists():
         z_path = LA_LEGACY / f"z_cv_{name}.npz"
     Z_cv     = sp.load_npz(str(z_path))
-    labels   = np.load(SB / "clinvar_labels.npy")
-    prot_ids = np.load(SB / "clinvar_protein_ids.npy", allow_pickle=True)
+    labels   = np.load(INTD / "clinvar_labels.npy")
+    prot_ids = np.load(INTD / "clinvar_protein_ids.npy", allow_pickle=True)
     return Z_cv, labels, prot_ids
 
 
@@ -221,6 +221,18 @@ def load_phenotype_data(name: str = DEFAULT_NAME):
     stab_mask: boolean array — rows with valid (non -1) label
     act_mask : boolean array
     """
+    # ── Early-return if phenotype cache is absent for this model ─────────────
+    _stab_path = COMBINED_CACHE / f"z_stab_{name}.npz"
+    _act_path  = COMBINED_CACHE / f"z_act_{name}.npz"
+    if not _stab_path.exists() or not _act_path.exists():
+        warnings.warn(f"load_phenotype_data: phenotype cache not found for '{name}' — "
+                      f"returning empty stubs. Run caching/save_ms_d5_cache.py first.")
+        _dict_size = MODEL_REGISTRY[name][2] * MODEL_REGISTRY[name][1] if name in MODEL_REGISTRY else 2048
+        _empty_z   = sp.csr_matrix((0, _dict_size))
+        _empty_y   = np.array([], dtype=np.int8)
+        _empty_m   = np.array([], dtype=bool)
+        return _empty_z, _empty_y, _empty_z, _empty_y, _empty_m, _empty_m
+
     # ── Stability ──────────────────────────────────────────────────────────────
     ddg_stab  = np.load(STAB_CACHE / "ddg_valid.npy")
     y_stab    = np.full(len(ddg_stab), -1, dtype=np.int8)
@@ -229,7 +241,7 @@ def load_phenotype_data(name: str = DEFAULT_NAME):
     y_stab[ddg_stab >= 1.5]         = 2   # destabilising
     stab_mask = y_stab >= 0
 
-    Z_stab = sp.load_npz(str(COMBINED_CACHE / f"z_stab_{name}.npz"))
+    Z_stab = sp.load_npz(str(_stab_path))
 
     # ── Activity ───────────────────────────────────────────────────────────────
     valid_idx = np.load(ACT_CACHE / "valid_idx.npy")
@@ -271,7 +283,7 @@ def load_phenotype_data(name: str = DEFAULT_NAME):
     y_act[[i for i, b in enumerate(bins) if b == "GoF"]]     = 2
     act_mask = y_act >= 0
 
-    Z_act = sp.load_npz(str(COMBINED_CACHE / f"z_act_{name}.npz"))
+    Z_act = sp.load_npz(str(_act_path))
 
     return Z_stab, y_stab, Z_act, y_act, stab_mask, act_mask
 
@@ -312,6 +324,11 @@ def train_recon_probes(Z_stab, y_stab, Z_act, y_act,
         if verbose:
             print(f"  Probes loaded from {cache_path}")
         return probes
+
+    if Z_stab.shape[0] == 0 or Z_act.shape[0] == 0:
+        if verbose:
+            print("  [skip] phenotype data not available — returning empty probes dict")
+        return {}
 
     probes = {}
     Z_by_dataset = {"stab": Z_stab, "act": Z_act}
@@ -403,7 +420,7 @@ def reconstruct_clinvar_variant_keys(cache_path: Path = None):
     complex_ids = np.array(complex_ids)
     variant_1b  = np.array(variant_1b)
 
-    labels = np.load(SB / "clinvar_labels.npy")
+    labels = np.load(INTD / "clinvar_labels.npy")
     assert len(complex_ids) == len(labels), (
         f"H5 filter gave {len(complex_ids)} rows but labels has {len(labels)}")
 

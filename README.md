@@ -42,6 +42,8 @@ discovery/
   validate_disease_clusters.py     ← 5c: gene names + Enrichr + condition counts
   cluster_validation_suite.py      ← 5d: full cluster validation (Sections 0B–5)
   within_family_analysis.py        ← within-family pathogenic vs. benign analysis
+  functional_site_analysis.py      ← 5e: loss-of-property enrichment per cluster
+  nmf_analysis.py                  ← NMF decomposition (complement to k-means)
 archive/                       ← superseded v1 scripts and notebooks
 ```
 
@@ -145,6 +147,25 @@ Encodes MegaScale stability variants (298 proteins, ~230k variants) through the 
 
 ```bash
 python -u caching/save_ms_d5_cache.py > caching/cache_stab.log 2>&1 &
+```
+
+### `cache_phenotype_z.py`
+
+Encodes pre-computed MegaScale (stability) and DMS (activity) WT/VT embeddings through
+any named SAE and saves `z_stab_{name}.npz` and `z_act_{name}.npz`. No new ProtT5
+inference required — reads from existing embedding caches in `collab_sae_cache/` and
+`activity_sae_cache/`.
+
+**Prerequisites:**
+- Trained SAE checkpoint: `sae_weights/combined/combined_{name}.pt`
+- `/data/ross/interp/collab_sae_cache/layer20_wt.npy` + `layer20_vt.npy`
+- `/data/ross/interp/activity_sae_cache/final_layer_wt.npy` + `final_layer_vt.npy`
+
+**Outputs:** `/data/ross/interp/combined_sae_cache/z_stab_{name}.npz`, `z_act_{name}.npz`
+
+```bash
+python -u caching/cache_phenotype_z.py --name diff_ef4_k256
+python -u caching/cache_phenotype_z.py --name diff_ef4_k256 --force  # overwrite
 ```
 
 ### `patch_activity_cache.py`
@@ -359,3 +380,73 @@ files use 1-based. Always apply `pos_1b = pos_0b + 1` when matching. See
 ProtT5 sequence-context similarity from mechanism signal. Clusters dissolve (Jaccard < 0.025)
 after residualization, confirming protein identity is the primary clustering axis — but
 within-family analysis (above) confirms mechanism-specific latents exist independently.
+
+---
+
+### 5e. Functional site loss-of-property enrichment — `functional_site_analysis.py`
+
+Tests whether disease variants at annotated functional residues (catalytic sites,
+metal-binding, PPI interfaces, etc.) cluster together in the SAE latent space.
+
+**Data sources:**
+- `/data/dbs/jose_struct_func_sites/structural_and_functional_sites/*.pos` — 30 site types,
+  PDB space, mapped to UniProt via SIFTS
+- `/data/dbs/metal_binding/gnomad_filtered_max300_ac10.parquet.csv` — metal coordination
+  data already in UniProt space
+- `/data/dbs/SIFTS/pdb_chain_uniprot_2026_05_02.csv` — PDB→UniProt residue mapping
+
+**Prerequisites:**
+- `z_cv_{name}.npz`, `z_hg_{name}.npz` from `clinvar_sparse_bottleneck_v2.py`
+- `clinvar_labels.npy`
+- `cv_variant_keys.npz` (generated on first run via `reconstruct_clinvar_variant_keys()`)
+
+**Outputs** → `/data/ross/interp/latent_analysis/validation/`:
+- `functional_site_enrichment_{name}.csv` — Fisher's exact (BH-corrected) per (cluster, site_type)
+- `functional_site_enrichment_heatmap_{name}.png` — cluster × site_type fold enrichment
+- `mutagenesis_overlay_{name}.csv` — jose mutagenesis variants matched to ClinVar (if any)
+- `functional_site_map.parquet` (cache) — `(UniProt, pos) → site_types`, built once from SIFTS
+
+```bash
+# First run builds SIFTS cache (~5 min); subsequent runs use it
+python -u discovery/functional_site_analysis.py --name concat_ef1_k128 \
+  > /data/ross/interp/latent_analysis/validation/run_funcsite.log 2>&1 &
+
+# Force rebuild of SIFTS cache
+python -u discovery/functional_site_analysis.py --rebuild-cache
+```
+
+**Site types tested:** `loss_catalytic`, `loss_metal_{zn,ca,mg,mn,fe,cu,hem,...}`,
+`loss_cofactor_{fad,nad,atp,plp,nucleotide}`, `loss_dna_binding`, `loss_rna_binding`,
+`loss_ppi_interface`, `loss_allostery`, `loss_phosphosite`, `loss_glycosite`,
+`cancer_hotspot`, `stability_site`.
+
+---
+
+### NMF analysis — `nmf_analysis.py`
+
+Non-negative Matrix Factorisation of disease-variant SAE activations. NMF is well-matched
+to TopK SAE activations (non-negative, additive) and produces interpretable basis vectors
+(mechanism prototypes). Compares components to k-means centroids.
+
+**Prerequisites:**
+- `z_cv_{name}.npz`, `z_hg_{name}.npz` from `clinvar_sparse_bottleneck_v2.py`
+- `clinvar_labels.npy`
+
+**Outputs** → `/data/ross/interp/latent_analysis/validation/`:
+- `nmf_W_{name}.npy` — component activations (186k, 50)
+- `nmf_H_{name}.npy` — basis vectors (50, dict_size) = mechanism prototypes
+- `nmf_vs_kmeans_cosine_{name}.csv` — cosine similarity of each NMF component to each k-means centroid
+- `nmf_vs_kmeans_cosine_heatmap_{name}.png`
+- `nmf_top_latents_{name}.csv` — top-20 latents per NMF component by H weight
+
+```bash
+python -u discovery/nmf_analysis.py --name concat_ef1_k128 \
+  > /data/ross/interp/latent_analysis/validation/run_nmf.log 2>&1 &
+
+# Different number of components
+python -u discovery/nmf_analysis.py --n-components 30
+```
+
+High cosine similarity (>0.7) between an NMF component and a k-means centroid confirms that
+mechanism is robust across decomposition methods. Components unique to NMF (no high-cosine
+k-means match) may represent mechanisms not captured by spherical clustering.
